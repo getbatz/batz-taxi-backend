@@ -1,19 +1,13 @@
 {
   "name": "batz-taxi",
   "version": "1.0.0",
-  "description": "",
+  "description": "Batz Taxi App Local",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^5.2.1",
-    "socket.io": "^4.8.3"
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
   }
 }
