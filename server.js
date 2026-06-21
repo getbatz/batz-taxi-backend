@@ -1,131 +1,161 @@
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
 
 const app = express();
-app.use(cors());
+const PORT = 3000;
 
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(__dirname));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-let users = {};       
-let drivers = {};     
-let activeOrders = [];
+// Создаем папку для хранения картинок профиля, если её нет
+if (!fs.existsSync('./uploads')) {
+    fs.mkdirSync('./uploads');
+}
 
-// Границы Щербактинского района по ТЗ
-const BOUNDING_BOX = { north: 53.5, south: 52.5, east: 78.5, west: 77.8 };
+// Настройка сохранения файлов
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, './uploads/'),
+    filename: (req, file, cb) => cb(null, 'avatar-' + Date.now() + path.extname(file.originalname))
+});
+const upload = multer({ storage: storage });
 
-console.log("🚕 Сервер БАЦ Такси v2.1 запущен...");
+// Файлы локальной базы данных
+const USERS_FILE = path.join(__dirname, 'local_users.json');
+const ORDERS_FILE = path.join(__dirname, 'local_orders.json');
+const CARS_FILE = path.join(__dirname, 'cars.json');
 
-io.on('connection', (socket) => {
-    
-    socket.on('auth_user', (data) => {
-        const { telegramId, firstName, role } = data;
-        socket.telegramId = telegramId;
+// Инициализация пустых файлов, если они отсутствуют
+if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '[]');
+if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 
-        if (role === 'driver') {
-            if (!drivers[telegramId]) {
-                drivers[telegramId] = {
-                    name: firstName, phone: '', carBrand: '', carModel: '', carColor: '', carNumber: '',
-                    kaspiPhone: '', kaspiName: '', preferredPayments: ['cash'],
-                    dailySummary: { ordersCount: 0, earnings: 0 }, history: []
-                };
-            }
-            socket.emit('auth_success', { profile: drivers[telegramId], isRegistered: !!drivers[telegramId].phone });
-        } else {
-            if (!users[telegramId]) {
-                users[telegramId] = { name: firstName, phone: '', history: [] };
-            }
-            socket.emit('auth_success', { profile: users[telegramId], isRegistered: !!users[telegramId].phone });
-        }
-    });
+const readJSON = (filePath) => JSON.parse(fs.readFileSync(filePath, 'utf8'));
+const writeJSON = (filePath, data) => fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 
-    socket.on('save_profile', (data) => {
-        const { telegramId, role, profileData } = data;
-        if (role === 'driver') {
-            drivers[telegramId] = { ...drivers[telegramId], ...profileData };
-            socket.emit('profile_updated', { profile: drivers[telegramId] });
-        } else {
-            users[telegramId] = { ...users[telegramId], ...profileData };
-            socket.emit('profile_updated', { profile: users[telegramId] });
-        }
-    });
+// --- МАРШРУТЫ ПРИЛОЖЕНИЯ ---
 
-    socket.on('create_order', (orderData) => {
-        const { fromLat, fromLng, toLat, toLng } = orderData;
-
-        // Корректная проверка Bounding Box из ТЗ (с запасом для районного центра и округов)
-        // Координаты Шарбакты (52.489, 78.16) четко попадают внутрь этого квадрата
-        const isFromValid = fromLat <= 54.0 && fromLat >= 51.5 && fromLng <= 79.5 && fromLng >= 76.5;
-        const isToValid = toLat <= 54.0 && toLat >= 51.5 && toLng <= 79.5 && toLng >= 76.5;
-
-        if (!isFromValid || !isToValid) {
-            socket.emit('order_error', { message: "Упс... в данном регионе БАЦ пока недоступен" });
-            return;
-        }
-
-        const newOrder = {
-            id: Date.now(),
-            passengerId: socket.id,
-            passengerTgId: socket.telegramId,
-            passengerName: users[socket.telegramId]?.name || "Пассажир",
-            passengerPhone: users[socket.telegramId]?.phone || "",
-            ...orderData,
-            status: 'searching'
-        };
-
-        activeOrders.push(newOrder);
-        io.emit('order_list_update', activeOrders);
-        socket.emit('order_created_success', { orderId: newOrder.id });
-    });
-
-    socket.on('driver_ready', () => {
-        socket.emit('order_list_update', activeOrders);
-    });
-
-    socket.on('accept_order', (data) => {
-        const orderIndex = activeOrders.findIndex(o => o.id === data.orderId);
-        const driverProfile = drivers[socket.telegramId];
-
-        if (orderIndex !== -1 && driverProfile) {
-            const order = activeOrders[orderIndex];
-            order.status = 'accepted';
-            order.driverId = socket.id;
-            order.driverTgId = socket.telegramId;
-            order.driverData = {
-                name: driverProfile.name,
-                phone: driverProfile.phone,
-                car: `${driverProfile.carColor} ${driverProfile.carBrand} ${driverProfile.carModel}`,
-                number: driverProfile.carNumber,
-                kaspiPhone: driverProfile.kaspiPhone,
-                kaspiName: driverProfile.kaspiName
-            };
-
-            io.to(order.passengerId).emit('order_status_changed', { status: 'accepted', driverData: order.driverData });
-            activeOrders.splice(orderIndex, 1);
-            io.emit('order_list_update', activeOrders);
-        }
-    });
-
-    socket.on('update_status', (data) => {
-        const { passengerId, status, price, orderId, fromText, toText } = data;
-        io.to(passengerId).emit('order_status_changed', { status });
-
-        if (status === 'finished') {
-            const dTgId = socket.telegramId;
-            if (drivers[dTgId]) {
-                drivers[dTgId].dailySummary.ordersCount += 1;
-                drivers[dTgId].dailySummary.earnings += Number(price);
-                drivers[dTgId].history.push({ id: orderId, fromText, toText, price, date: new Date().toLocaleTimeString() });
-            }
-        }
-    });
-
-    socket.on('disconnect', () => {});
+// 1. Получение автомобилей и цветов
+app.get('/api/cars-data', (req, res) => {
+    if (fs.existsSync(CARS_FILE)) {
+        res.json(readJSON(CARS_FILE));
+    } else {
+        res.json({ brands: [], colors: [] });
+    }
 });
 
-app.get('/', (req, res) => { res.send('Робот БАЦ v2.1 работает!'); });
+// 2. Регистрация нового пользователя
+app.post('/api/register', (req, res) => {
+    const { name, phone, dob, pin, role } = req.body;
+    const users = readJSON(USERS_FILE);
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`🚀 Сервер запущен`); });
+    if (users.find(u => u.phone === phone)) {
+        return res.json({ success: false, message: 'Этот номер телефона уже зарегистрирован!' });
+    }
+
+    const newUser = {
+        name,
+        phone,
+        dob,
+        pin,
+        role: role || 'passenger',
+        avatar: '',
+        bonuses: 200 // Приветственные бонусы в подарок
+    };
+
+    users.push(newUser);
+    writeJSON(USERS_FILE, users);
+    res.json({ success: true, user: newUser });
+});
+
+// 3. Авторизация по PIN-коду
+app.post('/api/login-pin', (req, res) => {
+    const { phone, pin } = req.body;
+    const users = readJSON(USERS_FILE);
+    const user = users.find(u => u.phone === phone && u.pin === pin);
+
+    if (user) {
+        res.json({ success: true, user });
+    } else {
+        res.json({ success: false, message: 'Неверный PIN-код быстрого входа!' });
+    }
+});
+
+// 4. Загрузка аватарки пользователя
+app.post('/api/user/upload-avatar', upload.single('avatar'), (req, res) => {
+    const { phone } = req.body;
+    if (!req.file) return res.json({ success: false, message: 'Файл картинки не получен' });
+
+    const users = readJSON(USERS_FILE);
+    const userIndex = users.findIndex(u => u.phone === phone);
+
+    if (userIndex !== -1) {
+        users[userIndex].avatar = '/uploads/' + req.file.filename;
+        writeJSON(USERS_FILE, users);
+        res.json({ success: true, avatarUrl: users[userIndex].avatar });
+    } else {
+        res.json({ success: false, message: 'Пользователь не найден' });
+    }
+});
+
+// 5. Создание поездки (Имитация для проверки работы)
+app.post('/api/orders/create', (req, res) => {
+    const { passengerPhone, from, to, price, paymentMethod } = req.body;
+    const orders = readJSON(ORDERS_FILE);
+
+    const newOrder = {
+        id: orders.length + 1,
+        passengerPhone,
+        from,
+        to,
+        price: Number(price) || 1000,
+        paymentMethod,
+        createdAt: new Date().toISOString()
+    };
+
+    orders.push(newOrder);
+    writeJSON(ORDERS_FILE, orders);
+    res.json({ success: true, order: newOrder });
+});
+
+// 6. АДМИНКА: Проверка входа администратора
+app.post('/api/admin/login', (req, res) => {
+    const { username, password } = req.body;
+    if (username === 'admin' && password === 'Batz2026') {
+        res.json({ success: true });
+    } else {
+        res.status(401).json({ success: false, message: 'Доступ заблокирован: неверные данные!' });
+    }
+});
+
+// 7. АДМИНКА: Расчет сводки (День, Неделя, Месяц) без внешних СУБД
+app.get('/api/admin/stats', (req, res) => {
+    const orders = readJSON(ORDERS_FILE);
+    const now = new Date();
+
+    const getStatsForDays = (days) => {
+        const msLimit = days * 24 * 60 * 60 * 1000;
+        const filtered = orders.filter(o => (now - new Date(o.createdAt)) <= msLimit);
+        return {
+            count: filtered.length,
+            revenue: filtered.reduce((sum, o) => sum + o.price, 0)
+        };
+    };
+
+    res.json({
+        day: getStatsForDays(1),
+        week: getStatsForDays(7),
+        month: getStatsForDays(30)
+    });
+});
+
+// Главная страница приложения
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+app.listen(PORT, () => {
+    console.log(`[Batz Taxi Server] Запущен на http://localhost:${PORT}`);
+});
